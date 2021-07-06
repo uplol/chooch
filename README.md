@@ -9,3 +9,5 @@ It was created in haste in attempt to download large files from servers across t
 ```bash
 chooch [URL] [OUTPUT_PATH]
 ```
+
+PRs welcome :)
