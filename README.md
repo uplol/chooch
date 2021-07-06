@@ -1,4 +1,4 @@
-# chooch
+# chooch - An Amazing Project
 
 Downloads files fast (in theory).
 
