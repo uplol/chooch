@@ -1,35 +1,27 @@
 use std::{
+    collections::BTreeSet,
+    ops::Range,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
-use futures::stream::FuturesOrdered;
-use reqwest::Url;
-use tokio::{sync::mpsc, time::Instant};
-use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
+use dynamic_pool::{DynamicPool, DynamicReset};
+use futures::{FutureExt, Stream, StreamExt};
+use reqwest::{Client, Url};
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub url: Url,
     pub concurrency: usize,
-    pub chunk_size_bytes: usize,
+    pub chunk_size_bytes: u64,
 }
 
 #[derive(Clone)]
 pub struct Choocher {
-    client: reqwest::Client,
+    worker_pool: DynamicPool<ChoocherWorker>,
     config: Config,
-    content_length: Option<usize>,
-    rolling_chunk_download_times: Arc<Mutex<Vec<f64>>>,
-}
-
-fn new_client() -> reqwest::Client {
-    reqwest::ClientBuilder::new()
-        .pool_idle_timeout(Duration::from_millis(1000))
-        .pool_max_idle_per_host(4)
-        .build()
-        .unwrap()
+    slowest_worker_killer: Arc<Mutex<ChoocherWorkerKiller>>,
 }
 
 impl Choocher {
@@ -38,182 +30,168 @@ impl Choocher {
         Self::new_with_config(Config {
             url,
             concurrency: 12,
-            chunk_size_bytes: 1024 * 1024 * 128, // 8 MB
+            chunk_size_bytes: 1024 * 1024 * 16, // 16 MB
         })
     }
 
     // Creates a new Choocher instance, allowing the caller to specify a detailed config.
     pub fn new_with_config(config: Config) -> Self {
+        let concurrency = config.concurrency;
+
         Self {
-            client: new_client(),
+            worker_pool: DynamicPool::new(0, concurrency, || ChoocherWorker::new()),
             config,
-            content_length: None,
-            rolling_chunk_download_times: Default::default(),
+            slowest_worker_killer: Arc::new(Mutex::new(ChoocherWorkerKiller::new(concurrency))),
         }
     }
 
-    /// Starts a Choocher with the default configuration and the configured url.
-    pub async fn stream(mut self) -> anyhow::Result<impl Stream<Item = Option<(Bytes, bool)>>> {
-        let max_concurrency = self.config.concurrency;
-        let chunk_size = self.config.chunk_size_bytes;
+    pub async fn chunks(self) -> anyhow::Result<(u64, impl Stream<Item = Bytes>)> {
+        let content_length = self.content_length().await?;
+        let chunks = self.chunks_for_content_length(content_length);
+        let url = self.config.url.clone();
+        let pool = self.worker_pool.clone();
+        let slowest_worker_killer = self.slowest_worker_killer.clone();
+        let chunk_stream = futures::stream::iter(chunks)
+            .map(move |chunk| {
+                let url = url.clone();
+                let worker = pool.take();
+                let download_duration_tracker = slowest_worker_killer.clone();
 
-        let (sink, output) = mpsc::channel(max_concurrency * 4);
+                // Spawn the download in its own task, so that we just have to poll the task completion, and can
+                // actually use many cores for the job.
+                let handle = tokio::spawn(async move {
+                    loop {
+                        let start = Instant::now();
 
-        let content_len = self.content_length().await?;
-        println!("Content Length: {}", content_len);
+                        if let Ok(bytes) = worker.fetch_chunk(url.clone(), chunk.clone()).await {
+                            let elapsed = start.elapsed();
 
-        let mut queue = FuturesOrdered::new();
-
-        // sink data to the stream sequentially
-        tokio::spawn(async move {
-            let mut last_range = false;
-            let (job_sink, mut job_queue) = mpsc::unbounded_channel();
-
-            let spawn_worker =
-                move |instance: Self, queue: &mut FuturesOrdered<_>, index, done_fn| {
-                    let chunk_offset = index * chunk_size;
-                    let mut range = (chunk_offset, chunk_offset + chunk_size - 1);
-                    let mut is_last_range = false;
-                    if range.1 >= content_len {
-                        is_last_range = true;
-                        range.1 = content_len - 1
-                    }
-                    println!("spawned chunk #{} range {:?}", index, range);
-                    queue.push(tokio::spawn(instance.work(done_fn, range, is_last_range)));
-                    return is_last_range;
-                };
-
-            let job_sink_inner = job_sink.clone();
-            let sinker = async move {
-                let mut idx = 0;
-                loop {
-                    let job_sink = job_sink_inner.clone();
-                    let done_fn = move |duration: Duration| {
-                        job_sink.send(Some(duration)).expect("couldn't send");
-                    };
-                    let rolling_chunk_times = self.rolling_chunk_download_times.clone();
-                    let mut spawner = self.clone();
-                    tokio::select! {
-                        Some(duration) = job_queue.recv() => {
-                            let mut recycle = false;
-                            if let Some(time) = duration {
-                                let secs = time.as_secs_f64();
-                                println!("chunk downloaded in {} ({} MBps)", secs, (chunk_size as f64/ secs) / 1_000_000.0);
-                                {
-                                    let mut times_mut = rolling_chunk_times.lock().unwrap();
-
-
-                                    let mut times_view = (*times_mut).clone();
-
-                                    times_view.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-                                    let len = times_view.len();
-                                    if len > 0 {
-                                        let mid = times_view.len() / 2;
-                                        let middle = times_view[mid];
-
-
-                                        // recycle connections that are slow
-                                        if secs - middle > (max_concurrency / 2) as f64 {
-                                            recycle = true;
-                                        }
-                                    }
-
-                                    if times_mut.len() > max_concurrency * 2 {
-                                        times_mut.pop();
-                                    }
-
-                                    times_mut.insert(0, secs);
-
-                                }
+                            // If we are the slowest download, we'll detach the client, forcing the pool to create a
+                            // new client in the future.
+                            if download_duration_tracker
+                                .lock()
+                                .unwrap()
+                                .should_discard_client(elapsed)
+                            {
+                                worker.detach();
                             }
-
-                            if recycle {
-                                spawner.client = new_client();
-                            }
-
-                            if !last_range {
-                                if spawn_worker(spawner, &mut queue, idx, done_fn) {
-                                    println!("last range spawned #{}", idx);
-                                    last_range = true;
-                                }
-                                idx += 1;
-                            }
-                        }
-                        Some(res) = queue.next() => {
-                            if let Ok(Ok((bytes, is_last_range))) = res {
-                                println!("flushing {} bytes", bytes.len());
-                                sink.send(Some((bytes, is_last_range)))
-                                    .await
-                                    .expect("error sending to sink queue");
-                            } else {
-                                println!("Error! {:?}", res);
-                                sink.send(None).await.expect("error finishing stream. sorry!");
-                            }
+                            return bytes;
                         }
                     }
-                }
-            };
+                });
 
-            let watchdog = tokio::spawn(sinker);
-            // warm the queue
-            for _ in 0..max_concurrency {
-                job_sink.send(None).expect("could not send new job");
-                tokio::time::sleep(Duration::from_millis(750)).await;
-            }
+                handle.map(|x| x.unwrap())
+            })
+            .buffered(self.config.concurrency);
 
-            watchdog.await.expect("error")
-        });
-
-        Ok(ReceiverStream::new(output))
+        Ok((content_length, chunk_stream))
     }
 
-    async fn work(
-        self: Self,
-        mut done_fn: impl FnMut(Duration) -> (),
-        range: (usize, usize),
-        is_last: bool,
-    ) -> anyhow::Result<(Bytes, bool)> {
-        let start_time = Instant::now();
+    fn chunks_for_content_length(&self, content_length: u64) -> Vec<Range<u64>> {
+        let mut chunks =
+            Vec::with_capacity((1 + (content_length / self.config.chunk_size_bytes)) as _);
+        let mut last_end = 0;
+
+        while last_end < content_length {
+            let start = last_end;
+            last_end = (start + self.config.chunk_size_bytes).min(content_length);
+            chunks.push(start..last_end - 1);
+        }
+
+        chunks
+    }
+
+    /// Gets the content length from the configured URL using the HEAD method.
+    async fn content_length(&self) -> anyhow::Result<u64> {
+        let worker = self.worker_pool.take();
+        let request = worker
+            .client()
+            .head(self.config.url.clone())
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let header = request
+            .headers()
+            .get("content-length")
+            .expect("expected content-length header");
+
+        Ok(header.to_str()?.parse()?)
+    }
+}
+
+struct ChoocherWorker {
+    client: Client,
+}
+
+impl ChoocherWorker {
+    fn new() -> Self {
+        let client = reqwest::ClientBuilder::new()
+            .pool_idle_timeout(Duration::from_millis(1000))
+            .pool_max_idle_per_host(1)
+            .build()
+            .unwrap();
+
+        Self { client }
+    }
+
+    fn client(&self) -> &Client {
+        &self.client
+    }
+
+    async fn fetch_chunk(&self, url: Url, range: Range<u64>) -> anyhow::Result<Bytes> {
         let res = self
             .client
-            .get(self.config.url)
-            .header("Range", format!("bytes={}-{}", range.0, range.1))
+            .get(url)
+            .header("Range", format!("bytes={}-{}", range.start, range.end))
             .send()
             .await?
             .error_for_status()?;
 
         let bytes = res.bytes().await?;
+        Ok(bytes)
+    }
+}
 
-        done_fn(Instant::now() - start_time);
+impl DynamicReset for ChoocherWorker {
+    fn reset(&mut self) {
+        // nothing to do here.
+    }
+}
 
-        Ok((bytes, is_last))
+struct ChoocherWorkerKiller {
+    target_concurrency: usize,
+    timings: BTreeSet<Duration>,
+}
+
+impl ChoocherWorkerKiller {
+    fn new(target_concurrency: usize) -> Self {
+        assert!(target_concurrency > 0);
+        Self {
+            target_concurrency,
+            timings: BTreeSet::new(),
+        }
     }
 
-    /// Returns (and the first time, fetches) the content length of the object in question.
-    pub async fn content_length(&mut self) -> anyhow::Result<usize> {
-        Ok(match self.content_length {
-            Some(len) => len,
-            None => {
-                let len = self.fetch_content_length().await?;
-                self.content_length.replace(len);
-                len
-            }
-        })
-    }
+    fn should_discard_client(&mut self, download_time: Duration) -> bool {
+        // We don't have enough samples yet.
+        if self.timings.len() < self.target_concurrency {
+            self.timings.insert(download_time);
+            return false;
+        }
 
-    /// Gets the content length from the configured URL using the HEAD method.
-    async fn fetch_content_length(&self) -> anyhow::Result<usize> {
-        let url = self.config.url.clone();
-        let req = self.client.head(url).send().await?.error_for_status()?;
+        let slowest_download_time = self
+            .timings
+            .iter()
+            .rev()
+            .next()
+            .expect("invariant: should have some timings.")
+            .clone();
 
-        let header = req
-            .headers()
-            .get("content-length")
-            .expect("expected content-length header");
+        self.timings.remove(&slowest_download_time);
+        self.timings.insert(download_time);
 
-        let length = header.to_str()?.parse::<usize>()?;
-
-        Ok(length)
+        // We'll track the last N many chunk downloads, and reject clients if they exceed the slowest download time repeatedly.
+        download_time > slowest_download_time
     }
 }
