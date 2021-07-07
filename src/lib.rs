@@ -92,7 +92,7 @@ impl Choocher {
 
         while last_end < content_length {
             let start = last_end;
-            last_end = (start + self.config.chunk_size_bytes).max(content_length);
+            last_end = (start + self.config.chunk_size_bytes).min(content_length);
             chunks.push(start..last_end - 1);
         }
 
