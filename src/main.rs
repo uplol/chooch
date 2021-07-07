@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use chooch::Choocher;
 
 use futures::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Url;
 use structopt::StructOpt;
 use tokio::io::AsyncWriteExt;
@@ -21,7 +22,10 @@ async fn main() -> anyhow::Result<()> {
     let opt = Opt::from_args();
 
     let choocher = Choocher::new(opt.url);
+    let bar = ProgressBar::new_spinner();
     let (content_length, mut chunks) = choocher.chunks().await?;
+    bar.set_length(content_length);
+    bar.set_style(ProgressStyle::default_spinner().template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes:>7}/{total_bytes:7} ({bytes_per_sec}, eta: {eta_precise})"));
 
     let mut bytes_written = 0;
     let real_path = opt.output.clone();
@@ -48,8 +52,11 @@ async fn main() -> anyhow::Result<()> {
 
     while let Some(chunk) = chunks.next().await {
         output_file.write_all(&chunk).await?;
+        bar.inc(chunk.len() as _);
         bytes_written += chunk.len();
     }
+
+    bar.finish();
 
     output_file.sync_all().await?;
 
