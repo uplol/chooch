@@ -30,7 +30,7 @@ impl Choocher {
         Self::new_with_config(Config {
             url,
             concurrency: 12,
-            chunk_size_bytes: 1024 * 1024 * 128, // 8 MB
+            chunk_size_bytes: 1024 * 1024 * 16, // 16 MB
         })
     }
 
