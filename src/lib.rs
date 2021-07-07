@@ -173,6 +173,7 @@ impl ChoocherWorkerKiller {
     }
 
     fn should_discard_client(&mut self, download_time: Duration) -> bool {
+        // We don't have enough samples yet.
         if self.timings.len() < self.target_concurrency {
             self.timings.insert(download_time);
             return false;
@@ -183,22 +184,13 @@ impl ChoocherWorkerKiller {
             .iter()
             .rev()
             .next()
-            .expect("invariant: should have some timings.");
-
-        if &download_time > slowest_download_time {
-            return true;
-        }
-
-        let fastest_download_time = self
-            .timings
-            .iter()
-            .next()
-            .expect("invariant: should have some timings")
+            .expect("invariant: should have some timings.")
             .clone();
 
-        self.timings.remove(&fastest_download_time);
+        self.timings.remove(&slowest_download_time);
         self.timings.insert(download_time);
 
-        false
+        // We'll track the last N many chunk downloads, and reject clients if they exceed the slowest download time repeatedly.
+        download_time > slowest_download_time
     }
 }
