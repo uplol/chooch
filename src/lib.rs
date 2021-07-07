@@ -14,7 +14,7 @@ use reqwest::{Client, Url};
 pub struct Config {
     pub url: Url,
     pub concurrency: usize,
-    pub chunk_size_bytes: usize,
+    pub chunk_size_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -45,14 +45,13 @@ impl Choocher {
         }
     }
 
-    pub async fn chunks(self) -> anyhow::Result<impl Stream<Item = Bytes>> {
+    pub async fn chunks(self) -> anyhow::Result<(u64, impl Stream<Item = Bytes>)> {
         let content_length = self.content_length().await?;
         let chunks = self.chunks_for_content_length(content_length);
         let url = self.config.url.clone();
         let pool = self.worker_pool.clone();
         let slowest_worker_killer = self.slowest_worker_killer.clone();
-
-        Ok(futures::stream::iter(chunks)
+        let chunk_stream = futures::stream::iter(chunks)
             .map(move |chunk| {
                 let url = url.clone();
                 let worker = pool.take();
@@ -83,11 +82,14 @@ impl Choocher {
 
                 handle.map(|x| x.unwrap())
             })
-            .buffered(self.config.concurrency))
+            .buffered(self.config.concurrency);
+
+        Ok((content_length, chunk_stream))
     }
 
-    fn chunks_for_content_length(&self, content_length: usize) -> Vec<Range<usize>> {
-        let mut chunks = Vec::with_capacity(content_length / self.config.chunk_size_bytes);
+    fn chunks_for_content_length(&self, content_length: u64) -> Vec<Range<u64>> {
+        let mut chunks =
+            Vec::with_capacity((1 + (content_length / self.config.chunk_size_bytes)) as _);
         let mut last_end = 0;
 
         while last_end < content_length {
@@ -100,7 +102,7 @@ impl Choocher {
     }
 
     /// Gets the content length from the configured URL using the HEAD method.
-    async fn content_length(&self) -> anyhow::Result<usize> {
+    async fn content_length(&self) -> anyhow::Result<u64> {
         let worker = self.worker_pool.take();
         let request = worker
             .client()
@@ -114,9 +116,7 @@ impl Choocher {
             .get("content-length")
             .expect("expected content-length header");
 
-        let length = header.to_str()?.parse::<usize>()?;
-
-        Ok(length)
+        Ok(header.to_str()?.parse()?)
     }
 }
 
@@ -139,7 +139,7 @@ impl ChoocherWorker {
         &self.client
     }
 
-    async fn fetch_chunk(&self, url: Url, range: Range<usize>) -> anyhow::Result<Bytes> {
+    async fn fetch_chunk(&self, url: Url, range: Range<u64>) -> anyhow::Result<Bytes> {
         let res = self
             .client
             .get(url)

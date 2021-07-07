@@ -21,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
     let opt = Opt::from_args();
 
     let choocher = Choocher::new(opt.url);
-    let mut chunks = choocher.chunks().await?;
+    let (content_length, mut chunks) = choocher.chunks().await?;
 
     let mut bytes_written = 0;
     let real_path = opt.output.clone();
@@ -43,6 +43,8 @@ async fn main() -> anyhow::Result<()> {
         .create_new(true)
         .open(&tmp_path)
         .await?;
+
+    output_file.set_len(content_length as _).await?;
 
     while let Some(chunk) = chunks.next().await {
         output_file.write_all(&chunk).await?;
