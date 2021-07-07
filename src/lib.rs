@@ -67,7 +67,8 @@ impl Choocher {
                         if let Ok(bytes) = worker.fetch_chunk(url.clone(), chunk.clone()).await {
                             let elapsed = start.elapsed();
 
-                            // If we are the slowest download,
+                            // If we are the slowest download, we'll detach the client, forcing the pool to create a
+                            // new client in the future.
                             if download_duration_tracker
                                 .lock()
                                 .unwrap()
