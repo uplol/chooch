@@ -1,5 +1,8 @@
+mod client;
+
 use std::{
     collections::BTreeSet,
+    net::IpAddr,
     ops::Range,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -8,13 +11,16 @@ use std::{
 use bytes::Bytes;
 use dynamic_pool::{DynamicPool, DynamicReset};
 use futures::{FutureExt, Stream, StreamExt};
-use reqwest::{Client, Url};
+use hyper::{Body, Uri};
+
+use crate::client::UniquePortClient;
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub url: Url,
+    pub url: Uri,
     pub concurrency: usize,
     pub chunk_size_bytes: usize,
+    pub bind_ip: Option<IpAddr>,
 }
 
 #[derive(Clone)]
@@ -26,20 +32,23 @@ pub struct Choocher {
 
 impl Choocher {
     /// Creates a new Choocher instance given the URL, uses an optimal default configuration.
-    pub fn new(url: Url, chunk_size: usize, worker_count: usize) -> Self {
+    pub fn new(url: Uri, chunk_size: usize, worker_count: usize, bind_ip: Option<IpAddr>) -> Self {
         Self::new_with_config(Config {
             url,
             concurrency: worker_count,
             chunk_size_bytes: chunk_size,
+            bind_ip,
         })
     }
 
     // Creates a new Choocher instance, allowing the caller to specify a detailed config.
     pub fn new_with_config(config: Config) -> Self {
         let concurrency = config.concurrency;
-
+        let bind_ip = config.bind_ip;
         Self {
-            worker_pool: DynamicPool::new(0, concurrency, || ChoocherWorker::new()),
+            worker_pool: DynamicPool::new(0, concurrency, move || {
+                ChoocherWorker::new(bind_ip.clone())
+            }),
             config,
             slowest_worker_killer: Arc::new(Mutex::new(ChoocherWorkerKiller::new(concurrency))),
         }
@@ -104,52 +113,46 @@ impl Choocher {
     /// Gets the content length from the configured URL using the HEAD method.
     async fn content_length(&self) -> anyhow::Result<u64> {
         let worker = self.worker_pool.take();
-        let request = worker
-            .client()
-            .head(self.config.url.clone())
-            .send()
-            .await?
-            .error_for_status()?;
-
-        let header = request
+        let client = worker.client();
+        let req = UniquePortClient::new_request(self.config.url.clone())
+            .method("HEAD")
+            .body(Body::empty())?;
+        let res = client.request(req).await?;
+        if !res.status().is_success() {
+            return Err(anyhow::anyhow!(format!("error status {}", res.status())));
+        }
+        let header = res
             .headers()
             .get("content-length")
             .expect("expected content-length header");
-
         Ok(header.to_str()?.parse()?)
     }
 }
 
 struct ChoocherWorker {
-    client: Client,
+    client: UniquePortClient,
 }
 
 impl ChoocherWorker {
-    fn new() -> Self {
-        let client = reqwest::ClientBuilder::new()
-            .pool_idle_timeout(Duration::from_millis(1000))
-            .pool_max_idle_per_host(1)
-            .build()
-            .unwrap();
-
-        Self { client }
+    fn new(bind_ip: Option<IpAddr>) -> Self {
+        Self {
+            client: UniquePortClient::new(bind_ip),
+        }
     }
 
-    fn client(&self) -> &Client {
+    fn client(&self) -> &UniquePortClient {
         &self.client
     }
 
-    async fn fetch_chunk(&self, url: Url, range: Range<usize>) -> anyhow::Result<Bytes> {
-        let res = self
-            .client
-            .get(url)
+    async fn fetch_chunk(&self, url: Uri, range: Range<usize>) -> anyhow::Result<Bytes> {
+        let req = UniquePortClient::new_request(url)
             .header("Range", format!("bytes={}-{}", range.start, range.end))
-            .send()
-            .await?
-            .error_for_status()?;
-
-        let bytes = res.bytes().await?;
-        Ok(bytes)
+            .body(Body::empty())?;
+        let res = self.client.request(req).await?;
+        if !res.status().is_success() {
+            return Err(anyhow::anyhow!(format!("error status {}", res.status())));
+        }
+        Ok(hyper::body::to_bytes(res.into_body()).await?)
     }
 }
 

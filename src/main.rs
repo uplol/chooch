@@ -1,11 +1,11 @@
-use std::path::PathBuf;
+use std::{net::IpAddr, path::PathBuf};
 
 use chooch::Choocher;
 
 use futures::StreamExt;
+use hyper::Uri;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
-use reqwest::Url;
 use structopt::StructOpt;
 use tokio::io::AsyncWriteExt;
 
@@ -20,7 +20,7 @@ fn parse_bytes(src: &str) -> Result<usize, &'static str> {
 )]
 struct Opt {
     #[structopt(name = "url", help = "The URL you wish to download")]
-    url: Url,
+    url: Uri,
     #[structopt(name = "output", help = "The output destination for this download")]
     output: PathBuf,
     #[structopt(long = "chunk-size", short, default_value = "32MB", parse(try_from_str = parse_bytes))]
@@ -39,13 +39,19 @@ struct Opt {
         help = "Skips the pre-allocation of the target file"
     )]
     skip_prealloc: bool,
+    #[structopt(
+        long = "bind-ip",
+        short = "ip",
+        help = "Sets the IP address used to make outgoing connections."
+    )]
+    bind_ip: Option<IpAddr>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let opt = Opt::from_args();
 
-    let choocher = Choocher::new(opt.url, opt.chunk_size, opt.worker_count);
+    let choocher = Choocher::new(opt.url, opt.chunk_size, opt.worker_count, opt.bind_ip);
 
     let (content_length, mut chunks) = choocher.chunks().await?;
 

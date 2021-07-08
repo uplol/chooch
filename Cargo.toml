@@ -14,6 +14,7 @@ dynamic-pool = "0.2"
 futures = "0.3"
 indicatif = "0.16"
 rand = "0.8"
-reqwest = "0.11"
+hyper = { version = "0.14", features = ["runtime", "client", "http1"] }
 structopt = "0.3"
 tokio = { version = "1", features = ["full"] }
+trust-dns-resolver = "0.20"
