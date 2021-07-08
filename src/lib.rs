@@ -14,7 +14,7 @@ use reqwest::{Client, Url};
 pub struct Config {
     pub url: Url,
     pub concurrency: usize,
-    pub chunk_size_bytes: u64,
+    pub chunk_size_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -26,11 +26,11 @@ pub struct Choocher {
 
 impl Choocher {
     /// Creates a new Choocher instance given the URL, uses an optimal default configuration.
-    pub fn new(url: Url) -> Self {
+    pub fn new(url: Url, chunk_size: usize, worker_count: usize) -> Self {
         Self::new_with_config(Config {
             url,
-            concurrency: 12,
-            chunk_size_bytes: 1024 * 1024 * 16, // 16 MB
+            concurrency: worker_count,
+            chunk_size_bytes: chunk_size,
         })
     }
 
@@ -45,8 +45,8 @@ impl Choocher {
         }
     }
 
-    pub async fn chunks(self) -> anyhow::Result<(u64, impl Stream<Item = Bytes>)> {
-        let content_length = self.content_length().await?;
+    pub async fn chunks(self) -> anyhow::Result<(usize, impl Stream<Item = Bytes>)> {
+        let content_length = self.content_length().await? as usize;
         let chunks = self.chunks_for_content_length(content_length);
         let url = self.config.url.clone();
         let pool = self.worker_pool.clone();
@@ -87,7 +87,7 @@ impl Choocher {
         Ok((content_length, chunk_stream))
     }
 
-    fn chunks_for_content_length(&self, content_length: u64) -> Vec<Range<u64>> {
+    fn chunks_for_content_length(&self, content_length: usize) -> Vec<Range<usize>> {
         let mut chunks =
             Vec::with_capacity((1 + (content_length / self.config.chunk_size_bytes)) as _);
         let mut last_end = 0;
@@ -139,7 +139,7 @@ impl ChoocherWorker {
         &self.client
     }
 
-    async fn fetch_chunk(&self, url: Url, range: Range<u64>) -> anyhow::Result<Bytes> {
+    async fn fetch_chunk(&self, url: Url, range: Range<usize>) -> anyhow::Result<Bytes> {
         let res = self
             .client
             .get(url)
