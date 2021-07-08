@@ -45,6 +45,12 @@ struct Opt {
         help = "Sets the IP address used to make outgoing connections."
     )]
     bind_ip: Option<IpAddr>,
+    #[structopt(
+        long = "no-interactive",
+        short = "n",
+        help = "Turns off the progress bar in favor of logging messages to stdout."
+    )]
+    no_interactive: bool,
 }
 
 #[tokio::main]
@@ -52,7 +58,6 @@ async fn main() -> anyhow::Result<()> {
     let opt = Opt::from_args();
 
     let choocher = Choocher::new(opt.url, opt.chunk_size, opt.worker_count, opt.bind_ip);
-
     let (content_length, mut chunks) = choocher.chunks().await?;
 
     let real_path = opt.output;
@@ -67,13 +72,20 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let skip_prealloc = opt.skip_prealloc;
+    let no_interactive = opt.no_interactive;
+    let tmp_path_filename = tmp_path
+        .clone()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     let task_res = tokio::spawn(async move {
         if !skip_prealloc {
             println!(
                 "preallocating file ({})",
-                bytefmt::format((content_length * 1024) as _)
+                bytefmt::format(content_length as _)
             );
-            output_file.set_len((content_length * 1024) as _).await?;
+            output_file.set_len(content_length as _).await?;
         }
 
         let mut bytes_written = 0;
@@ -83,6 +95,14 @@ async fn main() -> anyhow::Result<()> {
                 output_file.write_all(&chunk).await?;
                 bar.inc(chunk.len() as _);
                 bytes_written += chunk.len();
+                if no_interactive {
+                    println!(
+                        "{} downloaded {}% ({})",
+                        tmp_path_filename,
+                        f64::trunc((bytes_written as f64 / content_length as f64) * 100.0),
+                        bytefmt::format(bytes_written as _)
+                    );
+                }
             }
             output_file.flush().await?;
         }
@@ -108,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
     match res.await {
         Ok(bytes_written) => {
             println!("done! renaming to final destination...");
-            tokio::fs::rename(tmp_path, &real_path).await?;
+            tokio::fs::rename(&tmp_path, &real_path).await?;
             println!(
                 "{} bytes written to {}",
                 bytes_written,
@@ -118,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(e) => {
             println!("something went wrong. removing temp file...");
-            tokio::fs::remove_file(tmp_path).await.unwrap();
+            tokio::fs::remove_file(&tmp_path).await.unwrap();
             Err(e)
         }
     }
